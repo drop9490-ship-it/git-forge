@@ -14,8 +14,11 @@ export interface GitStore {
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
   defaultBranch: string;
-  packCache?: Map<string, Buffer>;
+  packCache?: Map<string, PackCacheEntry>;
 }
+
+/** One cached fetch response: the pack plus the shallow/unshallow lines it carries. */
+export interface PackCacheEntry { pack: Buffer; shallow: string[]; unshallow: string[]; }
 
 const HEX40 = /^[0-9a-f]{40}$/;
 export function isObjectId(v: string): boolean { return HEX40.test(v); }
@@ -116,8 +119,47 @@ export function collectReachable(roots: Iterable<string>, lookup: (oid: string) 
 }
 export function isAncestor(store: GitStore, anc: string, desc: string): boolean {
   if (anc === desc) return true;
-  const reach = collectReachable([desc], (o) => store.objects.get(o), true);
-  return reach.has(anc);
+  // Ancestry is a property of the commit parent graph only: trees and blobs can never
+  // lead to a commit, so a full reachability walk (which parses every tree and blob) is
+  // wasted work. A ref that points at a non-commit object is pathological; keep the old
+  // full-walk semantics for exactly that case.
+  const ancObj = store.objects.get(anc);
+  if (ancObj && ancObj.type !== 'commit') {
+    return collectReachable([desc], (o) => store.objects.get(o), true).has(anc);
+  }
+  // Resolve a tag desc to its target (tags are not part of the commit graph).
+  let cur = desc;
+  const seenTags = new Set<string>();
+  for (;;) {
+    const obj = store.objects.get(cur);
+    if (!obj) return false;
+    if (obj.type === 'tag') {
+      if (seenTags.has(cur)) return false;
+      seenTags.add(cur);
+      cur = parseTag(obj.data).object;
+      if (cur === anc) return true;
+      continue;
+    }
+    break;
+  }
+  const descObj = store.objects.get(cur);
+  if (!descObj || descObj.type !== 'commit') return false;
+  const head = parseCommit(descObj.data);
+  // Fast path: pushes are almost always linear, so the new tip's parents include the old tip.
+  if (head.parents.includes(anc)) return true;
+  // Commit-only BFS over parents (index pointer, not shift(): no quadratic re-indexing).
+  const seen = new Set<string>([cur]);
+  const queue = [...head.parents];
+  for (let qi = 0; qi < queue.length; qi++) {
+    const oid = queue[qi]!;
+    if (oid === anc) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const o = store.objects.get(oid);
+    if (!o || o.type !== 'commit') continue;
+    for (const p of parseCommit(o.data).parents) if (!seen.has(p)) queue.push(p);
+  }
+  return false;
 }
 
 // -------------------------------------------------------------------------------- pkt-line
@@ -171,10 +213,11 @@ function writePackHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 export function writePack(objects: readonly GitObject[]): Buffer {
-  const sorted = [...objects].sort((a, b) => {
-    const ao = hashObject(a.type, a.data); const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // Hash each object once and sort by oid. (The old code re-hashed both sides on every
+  // comparison: 2*N*log2(N) SHA-1s for a pack of N objects.)
+  const withOid = objects.map((o) => ({ o, oid: hashObject(o.type, o.data) }));
+  withOid.sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
+  const sorted = withOid.map((x) => x.o);
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
   header.write('PACK', 0, 4, 'ascii'); header.writeUInt32BE(2, 4); header.writeUInt32BE(sorted.length, 8);
@@ -285,7 +328,8 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   };
   for (const e of raw) {
     const obj = resolve(e);
-    const oid = hashObject(obj.type, obj.data);
+    // resolve() already hashed this object (e.oid); do not hash it a second time.
+    const oid = e.oid ?? hashObject(obj.type, obj.data);
     if (!objects.has(oid)) objects.set(oid, obj);
   }
   return objects;
@@ -442,25 +486,32 @@ export function fetchObjects(store: GitStore, req: FetchReq): { objects: GitObje
     }
   }
   // BFS over commits from wants, tracking distance; include trees/blobs/tags of included commits.
+  // Parsed commits are cached: the same commit is visited again for the shallow boundary and
+  // for the included-object pass below. The queue uses an index pointer, not shift().
+  const commitCache = new Map<string, CommitView>();
+  const commitOf = (oid: string): CommitView | undefined => {
+    let c = commitCache.get(oid);
+    if (c) return c;
+    const obj = lookup(oid);
+    if (!obj || obj.type !== 'commit') return undefined;
+    c = parseCommit(obj.data);
+    commitCache.set(oid, c);
+    return c;
+  };
   const included = new Set<string>();
   const commitDist = new Map<string, number>();
   const queue: Array<[string, number]> = [];
   for (const w of req.wants) if (isObjectId(w)) queue.push([w, 0]);
-  const shallowSet = new Set<string>();
-  while (queue.length) {
-    const [oid, dist] = queue.shift()!;
+  for (let qi = 0; qi < queue.length; qi++) {
+    const [oid, dist] = queue[qi]!;
     if (commitDist.has(oid)) continue;
     const obj = lookup(oid);
     if (!obj) continue;
     if (req.depth !== undefined && dist >= req.depth) continue;
     commitDist.set(oid, dist);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
-      for (const p of c.parents) {
-        if (req.depth !== undefined && dist + 1 >= req.depth) shallowSet.add(oid);
-        queue.push([p, dist + 1]);
-      }
-      if (obj.type === 'commit' && req.depth !== undefined && dist === req.depth - 1 && c.parents.length) shallowSet.add(oid);
+      const c = commitOf(oid)!;
+      for (const p of c.parents) queue.push([p, dist + 1]);
     } else if (obj.type === 'tag') {
       const t = parseTag(obj.data);
       if (t.type === 'commit') queue.push([t.object, dist]);
@@ -469,9 +520,8 @@ export function fetchObjects(store: GitStore, req: FetchReq): { objects: GitObje
   // Shallow boundary: included commits whose parents were NOT included.
   const shallow: string[] = [];
   for (const [oid] of commitDist) {
-    const obj = lookup(oid);
-    if (!obj || obj.type !== 'commit') continue;
-    const c = parseCommit(obj.data);
+    const c = commitOf(oid);
+    if (!c) continue;
     if (c.parents.length && c.parents.some((p) => !commitDist.has(p))) shallow.push(oid);
   }
   // Included objects: each included commit + its tree closure (tree/blobs only — never parents),
@@ -479,12 +529,12 @@ export function fetchObjects(store: GitStore, req: FetchReq): { objects: GitObje
   for (const [oid] of commitDist) {
     included.add(oid);
     const obj = lookup(oid);
-    if (obj?.type === 'commit') treeClosureInto(parseCommit(obj.data).tree, included);
+    if (obj?.type === 'commit') treeClosureInto(commitOf(oid)!.tree, included);
     else if (obj?.type === 'tag') {
       const t = parseTag(obj.data);
       included.add(t.object);
       const target = lookup(t.object);
-      if (target?.type === 'commit') { included.add(t.object); treeClosureInto(parseCommit(target.data).tree, included); }
+      if (target?.type === 'commit') { included.add(t.object); treeClosureInto(commitOf(t.object)!.tree, included); }
     }
   }
   for (const w of req.wants) {
@@ -519,16 +569,18 @@ export function handleUploadPack(store: GitStore, body: Buffer, v2: boolean): Bu
     if (v2) return Buffer.concat([pkt('packfile\n'), sidebandPack(writePack([])), FLUSH]);
     return Buffer.concat([pkt('NAK\n'), sidebandPack(writePack([])), FLUSH]);
   }
-  const { objects, shallow, unshallow } = fetchObjects(store, req);
   // The pack for a given request is deterministic; cache it (cleared on any
-  // mutation) so concurrent identical clones share one build.
+  // mutation) so concurrent identical clones share one build. The cache is
+  // consulted BEFORE the traversal: identical clones must not re-walk the history.
   const cacheKey = JSON.stringify({ w: [...req.wants].sort(), h: [...req.haves].sort(), s: [...req.shallow].sort(), d: req.depth ?? null });
-  let pack = store.packCache?.get(cacheKey);
-  if (!pack) {
-    pack = writePack(objects);
+  let entry = store.packCache?.get(cacheKey);
+  if (!entry) {
+    const { objects, shallow, unshallow } = fetchObjects(store, req);
+    entry = { pack: writePack(objects), shallow, unshallow };
     if (!store.packCache) store.packCache = new Map();
-    store.packCache.set(cacheKey, pack);
+    store.packCache.set(cacheKey, entry);
   }
+  const { pack, shallow, unshallow } = entry;
   if (v2) {
     const parts: Buffer[] = [];
     // Git's client expects an acknowledgments section only when it sent haves;

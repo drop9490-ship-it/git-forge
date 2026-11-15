@@ -18,6 +18,9 @@
 
 import { createApp } from './app.ts';
 
+// Entry name for the startup log lines below; the lifecycle itself is unchanged.
+const ENTRY_NAME = 'git-forge';
+
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
@@ -85,7 +88,7 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  process.stdout.write(`[entry] ${ENTRY_NAME} listening on port ${address.port}\n`);
 
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');

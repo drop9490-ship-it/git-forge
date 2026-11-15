@@ -1,7 +1,8 @@
 // app.ts — the forge: REST v3, GraphQL v4, MCP and git smart HTTP over one in-memory store.
 // Stdlib only. main.ts (lifecycle) is unchanged; this file is the server.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createRawServer, type RawReq, type RawRes } from './rawhttp.ts';
+import type { Server } from 'node:net';
 import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import {
@@ -317,14 +318,14 @@ function commitJson(r: Repo, oid: string): Record<string, unknown> {
 }
 
 // -------------------------------------------------------------------------------- HTTP helpers
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+function sendJson(res: RawRes, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
   const headers: Record<string, string> = { 'x-github-request-id': `req-${++reqCounter}`, ...extra };
   if (status !== 204) { headers['content-type'] = 'application/json; charset=utf-8'; headers['content-length'] = String(Buffer.byteLength(text)); }
   res.writeHead(status, headers);
   res.end(text);
 }
-function sendJsonText(res: ServerResponse, status: number, body: Buffer): void {
+function sendJsonText(res: RawRes, status: number, body: Buffer): void {
   // The caller passes a pre-built Buffer: content-length is its length, no
   // per-request byteLength scan and no string->Buffer re-encode in res.end.
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(body.length), 'x-github-request-id': `req-${++reqCounter}` });
@@ -337,23 +338,20 @@ function issueText(r: Repo, i: Issue): Buffer {
   r.issueTextCache.set(i.number, buf);
   return buf;
 }
-function sendErr(res: ServerResponse, status: number, message: string): void {
+function sendErr(res: RawRes, status: number, message: string): void {
   sendJson(res, status, { message });
 }
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+function readBody(req: RawReq): Promise<Buffer> {
+  // The raw transport buffers the whole body before dispatch, so this is a
+  // plain read of what is already there — no stream events, no concatenation.
+  return Promise.resolve(req.body);
 }
 function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false } {
   if (raw.length === 0) return { ok: true, value: {} };
   try { return { ok: true, value: JSON.parse(raw.toString('utf8')) }; }
   catch { return { ok: false }; }
 }
-function authed(req: IncomingMessage): boolean {
+function authed(req: RawReq): boolean {
   if (TOKEN === '') return true;
   const h = req.headers.authorization ?? '';
   return h === AUTH_HEADER;
@@ -365,13 +363,13 @@ function seg(path: string): string[] {
     try { return decodeURIComponent(s); } catch { return s; }
   });
 }
-function absUrl(req: IncomingMessage, path: string, query: Record<string, string | number>): string {
+function absUrl(req: RawReq, path: string, query: Record<string, string | number>): string {
   const host = req.headers.host ?? 'localhost';
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) qs.set(k, String(v));
   return `http://${host}${path}?${qs.toString()}`;
 }
-function paginate<T>(req: IncomingMessage, res: ServerResponse, items: T[], query: URLSearchParams, path: string): T[] {
+function paginate<T>(req: RawReq, res: RawRes, items: T[], query: URLSearchParams, path: string): T[] {
   const perPage = Math.max(1, Math.min(100, Number(query.get('per_page') ?? '30') || 30));
   const page = Math.max(1, Number(query.get('page') ?? '1') || 1);
   const total = items.length;
@@ -408,7 +406,7 @@ function dirTreeOid(r: Repo, prefix: string): string {
   return build(prefix);
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, parts: string[], query: URLSearchParams): Promise<boolean> {
+async function handleRest(req: RawReq, res: RawRes, parts: string[], query: URLSearchParams): Promise<boolean> {
   const method = req.method ?? 'GET';
   const bodyRaw = (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') ? await readBody(req) : Buffer.alloc(0);
   const parsed = parseJsonBody(bodyRaw);
@@ -669,10 +667,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
 }
 
 // -------------------------------------------------------------------------------- git smart HTTP
-async function handleGit(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, tail: string[], url: URL): Promise<boolean> {
+async function handleGit(req: RawReq, res: RawRes, owner: string, repoName: string, tail: string[], params: URLSearchParams): Promise<boolean> {
   const method = req.method ?? 'GET';
   const r = getRepo(owner, repoName);
-  const service = url.searchParams.get('service');
+  const service = params.get('service');
   const sendGitErr = (status: number, message: string): void => {
     res.writeHead(status, { 'content-type': 'application/json', 'x-github-request-id': `req-${++reqCounter}` });
     res.end(JSON.stringify({ message }));
@@ -1326,7 +1324,7 @@ function runGraphQL(doc: GDoc, body: Record<string, unknown>): { data: unknown; 
   }
 }
 
-async function handleGraphQL(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleGraphQL(req: RawReq, res: RawRes): Promise<void> {
   const raw = await readBody(req);
   const parsed = parseJsonBody(raw);
   if (!parsed.ok) { sendErr(res, 400, 'Problems parsing JSON'); return; }
@@ -1438,7 +1436,7 @@ function mcpCallTool(name: string, args: Record<string, unknown>): Record<string
   return mcpToolResult({ error: 'Unknown tool' }, true);
 }
 
-async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleMcp(req: RawReq, res: RawRes): Promise<void> {
   const raw = await readBody(req);
   const parsed = parseJsonBody(raw);
   if (!parsed.ok) {
@@ -1483,56 +1481,53 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 
 // -------------------------------------------------------------------------------- router
 export function createApp(): Server {
-  const server = createServer((req, res) => {
-    void (async () => {
-      try {
-        const t0 = PROFILING ? performance.now() : 0;
-        if (PROFILING) res.on('finish', () => profRecord(`${req.method ?? 'GET'} ${req.url ?? '/'}`, performance.now() - t0));
-        // Fast path: GET /api/v3/repos/{owner}/{repo}/issues/{n} — the benchmark's
-        // 2,000 sequential reads. Hit only: any miss (an encoded path, a query
-        // string, a non-numeric number, a missing repo or issue) falls through to
-        // the generic router, which answers it exactly as before.
-        if (req.method === 'GET') {
-          const fm = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(req.url ?? '/');
-          if (fm) {
-            if (!authed(req)) { sendErr(res, 401, 'Bad credentials'); return; }
-            const fr = getRepo(fm[1]!, fm[2]!);
-            const fi = fr?.issues.get(Number(fm[3]!));
-            if (fi) { sendJsonText(res, 200, issueText(fr, fi)); return; }
-          }
-        }
-        const url = new URL(req.url ?? '/', 'http://x');
-        const path = url.pathname;
-        if (path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
-        if (path.startsWith('/api/v3')) {
+  const server = createRawServer(async (req, res) => {
+    try {
+      const t0 = PROFILING ? performance.now() : 0;
+      if (PROFILING) res.on('finish', () => profRecord(`${req.method ?? 'GET'} ${req.url ?? '/'}`, performance.now() - t0));
+      // Fast path: GET /api/v3/repos/{owner}/{repo}/issues/{n} — the benchmark's
+      // 2,000 sequential reads. Hit only: any miss (an encoded path, a query
+      // string, a non-numeric number, a missing repo or issue) falls through to
+      // the generic router, which answers it exactly as before.
+      if (req.method === 'GET') {
+        const fm = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(req.url ?? '/');
+        if (fm) {
           if (!authed(req)) { sendErr(res, 401, 'Bad credentials'); return; }
-          const rest = path.slice('/api/v3'.length);
-          await handleRest(req, res, seg(rest), url.searchParams);
-          return;
+          const fr = getRepo(fm[1]!, fm[2]!);
+          const fi = fr?.issues.get(Number(fm[3]!));
+          if (fi) { sendJsonText(res, 200, issueText(fr, fi)); return; }
         }
-        if (path === '/api/graphql') {
-          if (!authed(req)) { sendErr(res, 401, 'Bad credentials'); return; }
-          await handleGraphQL(req, res);
-          return;
-        }
-        if (path === '/mcp') {
-          if (!authed(req)) { sendErr(res, 401, 'Bad credentials'); return; }
-          await handleMcp(req, res);
-          return;
-        }
-        const gm = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
-        if (gm) {
-          await handleGit(req, res, gm[1]!, gm[2]!, seg(gm[3] ?? ''), url);
-          return;
-        }
-        sendErr(res, 404, 'Not Found');
-      } catch (err) {
-        if (!res.headersSent) sendErr(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
-        else res.end();
       }
-    })();
+      // The raw transport already split the target: path is the raw pathname,
+      // params the parsed query — the same split `new URL` used to do.
+      const path = req.path;
+      if (path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
+      if (path.startsWith('/api/v3')) {
+        if (!authed(req)) { sendErr(res, 401, 'Bad credentials'); return; }
+        const rest = path.slice('/api/v3'.length);
+        await handleRest(req, res, seg(rest), req.params);
+        return;
+      }
+      if (path === '/api/graphql') {
+        if (!authed(req)) { sendErr(res, 401, 'Bad credentials'); return; }
+        await handleGraphQL(req, res);
+        return;
+      }
+      if (path === '/mcp') {
+        if (!authed(req)) { sendErr(res, 401, 'Bad credentials'); return; }
+        await handleMcp(req, res);
+        return;
+      }
+      const gm = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
+      if (gm) {
+        await handleGit(req, res, gm[1]!, gm[2]!, seg(gm[3] ?? ''), req.params);
+        return;
+      }
+      sendErr(res, 404, 'Not Found');
+    } catch (err) {
+      if (!res.headersSent) sendErr(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
+      else res.end();
+    }
   });
-  // Small responses on a keep-alive connection: disable Nagle so each reply goes out at once.
-  server.on('connection', (socket) => socket.setNoDelay(true));
   return server;
 }

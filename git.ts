@@ -6,6 +6,15 @@ import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 export const ZERO_OID = '0'.repeat(40);
+
+/** Phase timings for the profiler (app.ts dumps this on exit when PERF_PROFILE=1). */
+export const GIT_PROF = new Map<string, { n: number; ms: number }>();
+const GIT_PROF_ON = process.env.PERF_PROFILE === '1';
+function gprof(label: string, ms: number): void {
+  if (!GIT_PROF_ON) return;
+  const e = GIT_PROF.get(label);
+  if (e) { e.n++; e.ms += ms; } else GIT_PROF.set(label, { n: 1, ms });
+}
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 export interface GitObject { readonly type: GitObjectType; readonly data: Buffer; }
 export interface TreeEntry { readonly mode: string; readonly name: string; readonly oid: string; }
@@ -23,8 +32,13 @@ export interface PackCacheEntry { pack: Buffer; shallow: string[]; unshallow: st
 const HEX40 = /^[0-9a-f]{40}$/;
 export function isObjectId(v: string): boolean { return HEX40.test(v); }
 export function hashObject(type: GitObjectType, data: Buffer): string {
+  // One createHash with several updates: building the header with Buffer.from
+  // allocates a throwaway buffer per hash (measured ~3x slower in isolation).
   const h = createHash('sha1');
-  h.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  h.update(type);
+  h.update(' ');
+  h.update(String(data.length));
+  h.update('\0');
   h.update(data);
   return h.digest('hex');
 }
@@ -338,6 +352,13 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
 // -------------------------------------------------------------------------------- smart HTTP
 const AGENT = 'github-forge/1.0';
 const V2_CAPS = 'ls-refs=unborn\nfetch=shallow filter\nobject-format=sha1\nagent=github-forge/1.0\n';
+// The v2 capability advertisement never changes: build it once.
+const V2_ADVERTISEMENT: Buffer = (() => {
+  const lines: (string | 'flush')[] = ['version 2\n'];
+  for (const line of V2_CAPS.split('\n')) if (line) lines.push(`${line}\n`);
+  lines.push('flush');
+  return pktLines(lines);
+})();
 const V0_UPLOAD_CAPS = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta thin-pack multi_ack multi_ack_detailed shallow filter agent=github-forge/1.0 object-format=sha1';
 const V0_RECV_CAPS = 'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=github-forge/1.0 symref=HEAD:refs/heads/main';
 
@@ -353,12 +374,7 @@ function peelOf(store: GitStore, oid: string): string | undefined {
 /** GET info/refs body for a service. `v2` = client asked Git-Protocol: version=2 (upload-pack only). */
 export function advertisement(store: GitStore, service: 'git-upload-pack' | 'git-receive-pack', v2: boolean): Buffer {
   const tip = store.refs.get(`refs/heads/${store.defaultBranch}`);
-  if (service === 'git-upload-pack' && v2) {
-    const lines: (string | 'flush')[] = ['version 2\n'];
-    for (const line of V2_CAPS.split('\n')) if (line) lines.push(`${line}\n`);
-    lines.push('flush');
-    return pktLines(lines);
-  }
+  if (service === 'git-upload-pack' && v2) return V2_ADVERTISEMENT;
   const caps = service === 'git-upload-pack' ? V0_UPLOAD_CAPS : V0_RECV_CAPS;
   const preamble = `# service=${service}\n`;
   if (!tip && store.refs.size === 0) {
@@ -563,6 +579,7 @@ function sidebandPack(pack: Buffer): Buffer {
 
 /** POST git-upload-pack body → response body. `v2` from Git-Protocol header. Throws on bad input. */
 export function handleUploadPack(store: GitStore, body: Buffer, v2: boolean): Buffer {
+  const t0 = GIT_PROF_ON ? performance.now() : 0;
   const req = v2 ? parseFetchV2(body) : parseFetchV0(body);
   if (!req.wants.length) {
     // Empty fetch: answer with a packfile section carrying an empty pack.
@@ -575,12 +592,17 @@ export function handleUploadPack(store: GitStore, body: Buffer, v2: boolean): Bu
   const cacheKey = JSON.stringify({ w: [...req.wants].sort(), h: [...req.haves].sort(), s: [...req.shallow].sort(), d: req.depth ?? null });
   let entry = store.packCache?.get(cacheKey);
   if (!entry) {
+    const f0 = GIT_PROF_ON ? performance.now() : 0;
     const { objects, shallow, unshallow } = fetchObjects(store, req);
+    if (GIT_PROF_ON) gprof('upload.fetchObjects', performance.now() - f0);
+    const w0 = GIT_PROF_ON ? performance.now() : 0;
     entry = { pack: writePack(objects), shallow, unshallow };
+    if (GIT_PROF_ON) gprof('upload.writePack', performance.now() - w0);
     if (!store.packCache) store.packCache = new Map();
     store.packCache.set(cacheKey, entry);
-  }
+  } else if (GIT_PROF_ON) gprof('upload.cacheHit', 0);
   const { pack, shallow, unshallow } = entry;
+  let out: Buffer;
   if (v2) {
     const parts: Buffer[] = [];
     // Git's client expects an acknowledgments section only when it sent haves;
@@ -597,14 +619,17 @@ export function handleUploadPack(store: GitStore, body: Buffer, v2: boolean): Bu
     parts.push(pkt('packfile\n'));
     parts.push(sidebandPack(pack));
     parts.push(FLUSH);
-    return Buffer.concat(parts);
+    out = Buffer.concat(parts);
+  } else {
+    const parts: Buffer[] = [pkt('NAK\n')];
+    for (const s of shallow) parts.push(pkt(`shallow ${s}\n`));
+    for (const u of unshallow) parts.push(pkt(`unshallow ${u}\n`));
+    parts.push(sidebandPack(pack));
+    parts.push(FLUSH);
+    out = Buffer.concat(parts);
   }
-  const parts: Buffer[] = [pkt('NAK\n')];
-  for (const s of shallow) parts.push(pkt(`shallow ${s}\n`));
-  for (const u of unshallow) parts.push(pkt(`unshallow ${u}\n`));
-  parts.push(sidebandPack(pack));
-  parts.push(FLUSH);
-  return Buffer.concat(parts);
+  if (GIT_PROF_ON) gprof('upload.total', performance.now() - t0);
+  return out;
 }
 
 // ---- receive-pack ----
@@ -633,6 +658,7 @@ export function parsePush(body: Buffer): { commands: PushCommand[]; pack: Buffer
 
 /** Apply a receive-pack exchange. Returns the report body (sideband or raw pkt-lines). */
 export function handleReceivePack(store: GitStore, body: Buffer): Buffer {
+  const t0 = GIT_PROF_ON ? performance.now() : 0;
   const { commands, pack } = parsePush(body);
   const sideband = commands[0]?.caps.includes('side-band-64k') ?? false;
   const lines: string[] = [];
@@ -643,7 +669,11 @@ export function handleReceivePack(store: GitStore, body: Buffer): Buffer {
   if (updates || pack.length > 0) {
     if (pack.length === 0) { unpackOk = false; unpackDetail = 'unpack error: empty pack'; }
     else {
-      try { incoming = readPack(pack, (o) => store.objects.get(o)); }
+      try {
+        const r0 = GIT_PROF_ON ? performance.now() : 0;
+        incoming = readPack(pack, (o) => store.objects.get(o));
+        if (GIT_PROF_ON) gprof('receive.readPack', performance.now() - r0);
+      }
       catch (e) { unpackOk = false; unpackDetail = `unpack error: ${e instanceof Error ? e.message : String(e)}`; }
     }
   }
@@ -670,8 +700,10 @@ export function handleReceivePack(store: GitStore, body: Buffer): Buffer {
     if (cmd.newOid === cur) { results.push({ ref: cmd.ref, ok: true, reason: '' }); continue; }
     // Fast-forward: new tip must have old tip as ancestor (commit) or be same tag target.
     let ff = false;
+    const a0 = GIT_PROF_ON ? performance.now() : 0;
     if (target.type === 'commit') ff = isAncestor(store, cur, cmd.newOid);
     else if (target.type === 'tag') ff = isAncestor(store, cur, parseTag(target.data).object) || parseTag(target.data).object === cur;
+    if (GIT_PROF_ON) gprof('receive.isAncestor', performance.now() - a0);
     if (!ff) { results.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' }); continue; }
     store.refs.set(cmd.ref, cmd.newOid);
     results.push({ ref: cmd.ref, ok: true, reason: '' });
@@ -680,12 +712,13 @@ export function handleReceivePack(store: GitStore, body: Buffer): Buffer {
   for (const r of results) lines.push(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`);
   if (results.some((r) => r.ok)) store.packCache?.clear();
   const inner = pktLines([...lines, 'flush']);
-  if (!sideband) return inner;
+  if (!sideband) { if (GIT_PROF_ON) gprof('receive.total', performance.now() - t0); return inner; }
   // Band 1 carries the pkt-line report stream, chunked.
   const parts: Buffer[] = [];
   for (let off = 0; off < inner.length; off += 60000) {
     parts.push(pkt(Buffer.concat([Buffer.from([1]), inner.subarray(off, Math.min(inner.length, off + 60000))])));
   }
   parts.push(FLUSH);
+  if (GIT_PROF_ON) gprof('receive.total', performance.now() - t0);
   return Buffer.concat(parts);
 }
